@@ -1,9 +1,11 @@
 const express = require('express');
 const router = express.Router();
+const logger = require('../util/logger');
 
-router.get('/', function(req, res, next) {
-  res.status(200).send('test');
-  console.log('we got a request for test');
+router.post('/', function(req, res) {
+  logger.info('we got a request for test');
+  logger.info(req.user);
+  return res.status(200).send('test response');
 });
 
 module.exports = router;
