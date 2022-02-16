@@ -1,58 +1,149 @@
 const express = require('express');
 const fs = require('fs');
 const crypto = require('crypto');
+const { utils: etherUtils } = require("ethers");
+const format = require('pg-format');
+const ethers = require("ethers");
 
 const db = require('../util/db');
 const logger = require('../util/logger');
-const { makeHash, bufferToHex } = require('../util/hashing');
 
-const iterations = parseInt(process.env.ITERATIONS);
-const keyLength = parseInt(process.env.KEY_LENGTH);
+const provider = new ethers.providers.InfuraProvider(process.env.ETH_NETWORK, process.env.INFURA_PROJECT_ID);
+const signer = new ethers.Wallet('0x' + process.env.ETH_KEY, provider);
 
-const { getUser } = require('./user');
+const { getUser, ownsThisDoc } = require('./user');
 
-const createDocument = async (documentData, parties, email) => {
-  const salt = crypto.randomBytes(parseInt(process.env.SALTINESS));
-  const derivedKey = await makeHash(documentData.buffer, salt);
-  if (derivedKey.stack && derivedKey.message) {
-    logger.error(derivedKey);
-    reject('Error hashing document');
-  } else {
+const createDocument = async (documents, parties, email) => {
     try{
-
-
       const userData = await db.query('SELECT * from users WHERE email = $1', [email]);
       const userID = userData.rows[0].id;
-      logger.debug(`user email: ${email}, id: ${userID}`);
+      // logger.debug(`user email: ${email}, id: ${userID}`);
 
-      const transactionData = await db.query('SELECT MAX(id) FROM transactions', []);
-      const transactionID = transactionData.rows[0].max;
-      logger.debug(`transactionID: ${transactionID}`);
-
-      const documentsUnderTransaction = (await db.query('SELECT COUNT(id) FROM documents WHERE transaction_id = $1', [transactionID])).rows[0].count;
-      logger.debug(`docs under TXID ${transactionID}: ${documentsUnderTransaction}`);
-//TODO check associated item count, create new if above threshhold
-//TODO actually, write new route to get TXID and put partial sum solution in there
-      if (documentsUnderTransaction >= parseInt(process.env.MAX_ITEMS_IN_TX)) {
-//TODO create new transaction, grab new id
-      }
-
-      const insertValues = [derivedKey, salt, iterations, keyLength, documentData.originalname, documentData.size, new Date(), userID, transactionID, parties.length, 0];
-      logger.debug(`attempting to store document information:\n\t ${insertValues.map((val, i) => {insertValues[i]})}`);
-      // logger.warn('STOPPING HERE');
-      // return res.status(200).send({derivedKey: 'asdfasdf'});
-
-      const insertResponse = db.query(
-        'INSERT INTO documents (hash, salt, iterations, key_length, original_file_name, original_file_size, ingestion_date, owner_id, transaction_id, signatures_needed, signatures_obtained) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)',
-        insertValues);
-        logger.debug(`successfully stored ${documentData.originalname} as ${bufferToHex(derivedKey)}`);
-
-        return { documentName: documentData.originalname, salt, iterations, keyLength, derivedKey: bufferToHex(derivedKey)};
-      } catch (e) {
+      const insertQuery = format(
+        'INSERT INTO documents (hash, original_file_name, original_file_size, description, ingestion_date, approval_date, owner_id, signatures_needed, signatures_obtained) VALUES %L',
+        documents.map((doc) => [etherUtils.keccak256(doc.buffer), doc.originalname, doc.size, doc.description || '', new Date(), new Date(), userID, parties.length, 0]));
+      const insertResponse = db.query(insertQuery);
+      logger.debug(`successfully stored ${documents.length} files for user ${userID} (${email})`);
+    } catch (e) {
         logger.error(`database error: ${e}`);
-        reject(e.constraint === 'transaction_id_foreign_key' ? 'transaction not found for this document' : 'database error');
-      }
+        Promise.reject(e.constraint === 'folder_id_foreign_key' ? 'folder not found for this document' : 'database error');
     }
+};
+
+const getReadyToSendDocuments = async () => {
+  try {
+    return (await db.query('SELECT * FROM documents WHERE approval_date IS NOT NULL AND transaction_hash IS NULL', [])).rows;
+
+  } catch (e) {
+    logger.error(e);
+    Promise.reject(e);
+  }
+};
+
+const getDocumentsWithPendingTransactions = async () => {
+  try {
+    return (await db.query('SELECT * FROM documents WHERE transaction_hash IS NOT NULL AND block_hash IS NULL', [])).rows;
+  } catch (e) {
+    logger.error(e);
+    Promise.reject(e);
+  }
+};
+
+const sendAllReadyDocuments = async () => {
+
+  //TODO sending them all, then taking one off, then continuing. fix
+  //TODO fix active txs
+  //TODO markseent -> updateDB
+  let documentsToSend = [];
+
+  try {
+    documentsToSend = await getReadyToSendDocuments();
+    logger.info(`${documentsToSend.length} documents waiting to be sent to blockchain`);
+  } catch (e) {
+    logger.error(e);
+  }
+  if (documentsToSend.length > 0) {
+    try {
+      const txHexData = '0x' + documentsToSend.map(doc => doc.hash.slice(2,doc.hash.length)).join('');
+      const tx = {
+        to: process.env.ETH_ACCOUNT,
+        value: 0,
+        data: txHexData
+      };
+
+      const balance = await signer.getBalance();
+      const gasNeeded = await signer.estimateGas(tx);
+      logger.info(`transaction details:
+        ${documentsToSend.length} documents, ${parseFloat(Buffer.byteLength(txHexData, 'hex') / 1024).toFixed(2)}KB
+        gas needed: ${gasNeeded.toString()}
+        available:  ${balance} (${ethers.utils.formatEther(balance)} ETH)
+        ${balance.gte(gasNeeded) ? '' : 'in'}sufficient balance to fund this transaction`);
+
+      const txResponse = await signer.sendTransaction(tx);
+      logger.debug(`sent:
+        from: ${txResponse.from}
+        to: ${txResponse.to}
+        tx hash: ${txResponse.hash}`);
+      await db.query(format(
+        'UPDATE documents SET blockchain_date=%L, block_number=%L, transaction_hash=%L WHERE id IN (%L)',
+        txResponse.timestamp, txResponse.blockNumber, txResponse.hash, documentsToSend.map((doc) => doc.id)));
+      logger.info(`updated transaction information for ${documentsToSend.length} rows`);
+
+    } catch (e) {
+      logger.error(e.reason || e.message || e);
+    }
+  }
+}
+
+const verifyPendingTransactions = async () => {
+  let pendingDocuments = [];
+
+  try {
+    pendingDocuments = await getDocumentsWithPendingTransactions();
+    logger.info(`${pendingDocuments.length} documents waiting to be verified`);
+  } catch (e) {
+
+  }
+
+  if (pendingDocuments.length > 0) {
+    try {
+      const txReceipts = [];
+
+      for(const doc of pendingDocuments) {
+        txReceipts.some((receipt) => doc.transaction_hash == receipt.receipt.transactionHash)
+          ? txReceipts[txReceipts.findIndex((receipt) => doc.transaction_hash == receipt.receipt.transactionHash)].docIDs.push(doc.id)
+          : txReceipts.push({receipt: (await (provider.getTransactionReceipt(doc.transaction_hash))), docIDs: [doc.id]});
+      };
+      logger.debug(`receipts to process:${txReceipts.map((receipt) => `\n\t${receipt.receipt.transactionHash} (${receipt.docIDs.length} documents)`)}`);
+      const updatePromises = [];
+      for (const receipt of txReceipts) {
+        updatePromises.push(db.query(format(
+          'UPDATE documents SET blockchain_date=%L, block_number=%L, block_hash=%L WHERE id IN (%L)',
+          receipt.receipt.timestamp, receipt.receipt.blockNumber, receipt.receipt.blockHash, receipt.docIDs)));
+      }
+      Promise.all(updatePromises).then((values) => {
+        logger.info(`updated transaction information for ${pendingDocuments.length} rows, ${values.length} transactions`);
+      });
+
+    } catch (e) {
+      logger.error(e);
+    }
+  }
+
+
+  // const pendingTransactions = pendingDocuments.map((doc) => { pendingTransactions.})
+};
+
+const txHexDataToDocumentHashes = (txHexData) => {
+  const docHashes = [];
+  for (let i = 2; i < txHexData.length; i += parseInt(process.env.KEY_LENGTH)) {
+    docHashes.push('0x' + txHexData.slice(i, i + parseInt(process.env.KEY_LENGTH)));
+  }
+  return docHashes;
+};
+
+const getDocument = async (id) => {
+  return (await db.query('SELECT * from documents WHERE id = $1', [id])).rows[0];
 };
 
 const router = express.Router();
@@ -86,22 +177,23 @@ parties.forEach((party, i) => {
 });
 
 router.post('/create', async (req, res, next) => {
+  const uploadedDocuments = req.files;
+  const parties = JSON.parse(req.body.parties);
+  const description = JSON.parse(req.body.description);
+  const token = req.headers.authorization.split(' ')[1];
 
-  const documentData = req.file;
-  const { parties } = req.body;
-
-  if (!documentData) {
+  if (!uploadedDocuments) {
     logger.warn('document/create request received without document data');
     return res.status(400).send('document file is required');
   }
-
-  logger.debug(`document/create request received for ${documentData.originalname} (${Math.trunc(documentData.size/1024,2)}KB)`)
+  logger.debug(`document/create request received for${uploadedDocuments.map((doc) => `\n\t${doc.originalname} (${Math.trunc(doc.size/1024,2)}KB})`)}`);
 
   try{
-    const userProfileResponse = await getUser(req.headers.authorization.split(' ')[1]);
+    const userProfileResponse = await getUser(token);
     const { email } = userProfileResponse.data;
 
-    return res.status(200).send(createDocument(documentData, parties, email));
+    createDocument(uploadedDocuments, parties, email)
+    return res.status(200).send();
   } catch (e) {
     logger.error(e);
     return res.status(500).send(e);
@@ -112,6 +204,8 @@ router.post('/create', async (req, res, next) => {
 router.post('/verify', async (req, res, next) => {
   const documentData = req.file;
   const { id } = req.body;
+  console.log(id);
+  const token = req.headers.authorization.split(' ')[1];
 
   if (!documentData) {
     logger.warn('document/verify request received without document data');
@@ -120,25 +214,93 @@ router.post('/verify', async (req, res, next) => {
 
   logger.debug(`document/verify request received for ${documentData.originalname} (${Math.trunc(documentData.size/1024,2)}KB)`)
 
-  const user = (await db.query('SELECT * from users WHERE email = $1', [(await getUser(req.headers.authorization.split(' ')[1])).data.email])).rows[0];
-  const documentOnRecord = (await db.query('SELECT * from documents WHERE id = $1', [id])).rows[0];
-
-  if(user.id !== documentOnRecord.owner_id) {
-    logger.warn(`user ${user.id} (${user.email}) attempted to verify document ${documentOnRecord.id} (${documentData.originalname}), but does not own it`);
+  if(!ownsThisDoc(token, id)) {
+    logger.warn(`user attempted to verify document ${id}, but does not own it:\n\t${JSON.stringify(req.user)}`);
     return res.status(403).send('you do not own that document');
   }
 
-  const derivedKey = makeHash(documentData.buffer, documentOnRecord.salt, parseInt(documentOnRecord.iterations), parseInt(documentOnRecord.key_length));
-  if (derivedKey.stack && derivedKey.message) {
-    logger.error(derivedKey);
-    return res.status(500).send('unable to verify document');
-  } else {
-    const match = bufferToHex(derivedKey) == bufferToHex(documentOnRecord.hash);
-    logger.debug(`hashes ${match ? '' : 'do not' }match\n\tsubmitted document: ${bufferToHex(derivedKey)}\n\tdocument on record: ${bufferToHex(documentOnRecord.hash)}
-    used on-record parameters:\n\tsalt: ${bufferToHex(documentOnRecord.salt)}\n\titerations: ${documentOnRecord.iterations}\n\tkey length: ${documentOnRecord.key_length}`);
-    return res.status(200).send(match);
+  const hash = etherUtils.keccak256(documentData.buffer);
+  const documentOnRecord = (await getDocument(id));
+  const match = hash == documentOnRecord.hash;
+  logger.debug(`hashes ${match ? '' : 'do not ' }match\n\tsubmitted document: ${hash}\n\tdocument on record: ${documentOnRecord.hash}`);
+  return res.status(200).send(match);
+});
+
+router.post('/approve', async (req, res, next) => {
+  const { id } = req.body;
+  const token = req.headers.authorization.split(' ')[1];
+  const userProfileResponse = await getUser(token);
+  const { email } = userProfileResponse.data;
+
+  logger.debug(`document/approve request received for ${id}`)
+
+  try {
+    if(!ownsThisDoc(token, id)) {
+      logger.warn(`user attempted to approve document ${id}, but does not own it:\n\t${JSON.stringify(req.user)}`);
+      return res.status(403).send('you do not own that document');
+    }
+
+    const insertResponse = db.query(
+      'UPDATE documents SET approval_date=$1 WHERE id=$2',
+      [new Date(), id]);
+      logger.debug(`successfully approved ${id}`);
+    return res.status(200).send(`successfully approved ${id}`);
+  } catch (e) {
+    logger.error(e);
   }
 });
 
+router.post('/cancel', async (req, res, next) => {
+  const { id } = req.body;
+  const token = req.headers.authorization.split(' ')[1];
+  const userProfileResponse = await getUser(token);
+  const { email } = userProfileResponse.data;
 
-module.exports = router;
+  logger.debug(`document/cancel request received for ${id}`)
+
+  try {
+    if(!ownsThisDoc(token, id)) {
+      logger.warn(`user attempted to cancel document ${id}, but does not own it:\n\t${JSON.stringify(req.user)}`);
+      return res.status(403).send('you do not own that document');
+    }
+
+    const insertResponse = db.query(
+      'UPDATE documents SET approval_date=NULL WHERE id=$1',
+      [id]);
+      logger.debug(`successfully cancelled ${id}`);
+    return res.status(200).send(`successfully cancelled ${id}`);
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+router.post('/remove', async (req, res, next) => {
+  const { id } = req.body;
+  const token = req.headers.authorization.split(' ')[1];
+  const userProfileResponse = await getUser(token);
+  const { email } = userProfileResponse.data;
+
+  logger.debug(`document/remove request received for ${id}`)
+
+  try {
+    if(!ownsThisDoc(token, id)) {
+      logger.warn(`user attempted to remove document ${id}, but does not own it:\n\t${JSON.stringify(req.user)}`);
+      return res.status(403).send('you do not own that document');
+    }
+
+    const insertResponse = db.query(
+      'DELETE FROM documents WHERE id=$1',
+      [id]);
+      logger.debug(`successfully removed ${id}`);
+    return res.status(200).send(`successfully removed ${id}`);
+  } catch (e) {
+    logger.error(e);
+  }
+});
+
+router.post('/getBlockchainLink', async (req, res, next) => {
+  return res.status(200).send(`${process.env.ETH_TX_DETAILS_PATH}/${req.body.id}`);
+});
+
+
+module.exports = { router, sendAllReadyDocuments, getReadyToSendDocuments, txHexDataToDocumentHashes, verifyPendingTransactions };

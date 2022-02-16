@@ -6,14 +6,26 @@ const logger = require('../util/logger');
 
 const router = express.Router();
 
-const iterations = parseInt(process.env.ITERATIONS);
-const keyLength = parseInt(process.env.KEY_LENGTH);
-
 const getUser = async (token) => axios({
   method: 'get',
   url: `${process.env.DOMAIN}/userinfo`,
   headers: { authorization: `Bearer ${token}` },
   });
+
+const ownsThisDoc = async (token, id) => {
+  try {
+    const userProfileResponse = await getUser(token);
+    const { email } = userProfileResponse.data;
+
+    const user = (await db.query('SELECT * from users WHERE email = $1', [email])).rows[0];
+    const documentOnRecord = (await db.query('SELECT * from documents WHERE id = $1', [id])).rows[0];
+
+    return user.id == documentOnRecord.owner_id;
+  } catch (e) {
+    logger.error(e);
+    return false;
+  }
+}
 
 router.post('/profile', async (req, res) => {
 
@@ -31,11 +43,11 @@ router.post('/ownedDocuments', async (req, res) => {
     const { email, first_name, last_name } = userInfoResponse.data;
 
     const userInfoDBResponse = await db.query('SELECT id FROM users WHERE email = $1', [email]);
-    if (userInfoDBResponse.rowCount === 0) {
-      logger.warn(`user entry not found for ${email} in user table, creating`);
-      const userCreationDBResponse = await db.query('INSERT INTO users (email, first_name, last_name) VALUES ($1, $2, $3)', [email, first_name, last_name]);
-    }
-    const documentListDBResponse = await db.query('SELECT documents.* from users, documents WHERE documents.owner_id = users.id AND users.email = $1', [email]);
+    // if (userInfoDBResponse.rowCount === 0) {
+    //   logger.warn(`user entry not found for ${email} in user table, creating`);
+    //   const userCreationDBResponse = await db.query('INSERT INTO users (email, first_name, last_name) VALUES ($1, $2, $3)', [email, first_name, last_name]);
+    // }
+    const documentListDBResponse = await db.query('SELECT documents.* from users, documents WHERE documents.owner_id = users.id AND users.email = $1 ORDER BY ingestion_date', [email]);
     // logger.debug(documentListDBResponse.rows[0]);
     return res.status(200).send(documentListDBResponse.rows);
 
@@ -45,4 +57,4 @@ router.post('/ownedDocuments', async (req, res) => {
     }
   });
 
-module.exports = { router, getUser };
+module.exports = { router, getUser, ownsThisDoc };

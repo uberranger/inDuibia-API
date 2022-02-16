@@ -2,10 +2,11 @@ module.exports = require('pino')({
   transport: {
     target: 'pino-pretty',
     options: {
-      colorize: true
+      colorize: true,
+      translateTime: 'SYS:standard',
+      ignore: 'hostname, pid'
     },
   },
   level: process.env.LOG_LEVEL || 'error',
-  translateTime: true,
   levelFirst: true,
 });
