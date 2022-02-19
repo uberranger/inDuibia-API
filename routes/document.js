@@ -1,19 +1,19 @@
 const express = require('express');
-const fs = require('fs');
-const crypto = require('crypto');
-const { utils: etherUtils } = require("ethers");
 const format = require('pg-format');
 const ethers = require("ethers");
+const axios = require('axios');
 
 const db = require('../util/db');
 const logger = require('../util/logger');
 
-const provider = new ethers.providers.InfuraProvider(process.env.ETH_NETWORK, process.env.INFURA_PROJECT_ID);
+// const provider = new ethers.providers.InfuraProvider(process.env.ETH_NETWORK, process.env.INFURA_PROJECT_ID);
+const provider = new ethers.getDefaultProvider(process.env.ETH_NETWORK, {etherscan: process.env.ETHERSCAN_API_KEY});
 const signer = new ethers.Wallet('0x' + process.env.ETH_KEY, provider);
+// const etherScanProvider = new ethers.providers.EtherscanProvider(process.env.ETH_NETWORK, process.env.ETHERSCAN_API_KEY);
 
 const { getUser, ownsThisDoc } = require('./user');
 
-const createDocument = async (documents, parties, email) => {
+const createDocument = async (documents, parties, description, email) => {
     try{
       const userData = await db.query('SELECT * from users WHERE email = $1', [email]);
       const userID = userData.rows[0].id;
@@ -21,7 +21,7 @@ const createDocument = async (documents, parties, email) => {
 
       const insertQuery = format(
         'INSERT INTO documents (hash, original_file_name, original_file_size, description, ingestion_date, approval_date, owner_id, signatures_needed, signatures_obtained) VALUES %L',
-        documents.map((doc) => [etherUtils.keccak256(doc.buffer), doc.originalname, doc.size, doc.description || '', new Date(), new Date(), userID, parties.length, 0]));
+        documents.map((doc) => [ethers.utils.keccak256(doc.buffer), doc.originalname, doc.size, description || '', new Date(), new Date(), userID, parties.length, 0]));
       const insertResponse = db.query(insertQuery);
       logger.debug(`successfully stored ${documents.length} files for user ${userID} (${email})`);
     } catch (e) {
@@ -86,7 +86,7 @@ const sendAllReadyDocuments = async () => {
         tx hash: ${txResponse.hash}`);
       await db.query(format(
         'UPDATE documents SET blockchain_date=%L, block_number=%L, transaction_hash=%L WHERE id IN (%L)',
-        txResponse.timestamp, txResponse.blockNumber, txResponse.hash, documentsToSend.map((doc) => doc.id)));
+        txResponse.timestamp || new Date(), txResponse.blockNumber, txResponse.hash, documentsToSend.map((doc) => doc.id)));
       logger.info(`updated transaction information for ${documentsToSend.length} rows`);
 
     } catch (e) {
@@ -116,13 +116,23 @@ const verifyPendingTransactions = async () => {
       };
       logger.debug(`receipts to process:${txReceipts.map((receipt) => `\n\t${receipt.receipt.transactionHash} (${receipt.docIDs.length} documents)`)}`);
       const updatePromises = [];
+      let totalCost = 0;
+
+      const etherPrice = (await axios({method: 'get', url: `https://api.etherscan.io/api?module=stats&action=ethprice&apikey=${process.env.ETHERSCAN_API_KEY}`,})).data.result.ethusd;
+
       for (const receipt of txReceipts) {
+        // logger.debug(`debugging receipt: ${JSON.stringify(receipt)}`);
+        const cost = ((ethers.utils.formatEther(receipt.receipt.effectiveGasPrice.mul(receipt.receipt.gasUsed))) / etherPrice).toFixed(2);
+        logger.info(`transaction ${receipt.receipt.status ? 'succeeded' : 'failed'}, cost $${cost} USD`);
+
+        totalCost += cost;
+
         updatePromises.push(db.query(format(
           'UPDATE documents SET blockchain_date=%L, block_number=%L, block_hash=%L WHERE id IN (%L)',
-          receipt.receipt.timestamp, receipt.receipt.blockNumber, receipt.receipt.blockHash, receipt.docIDs)));
+          receipt.receipt.timestamp || new Date(), receipt.receipt.blockNumber, receipt.receipt.blockHash, receipt.docIDs)));
       }
       Promise.all(updatePromises).then((values) => {
-        logger.info(`updated transaction information for ${pendingDocuments.length} rows, ${values.length} transactions`);
+        logger.info(`updated transaction information for ${pendingDocuments.length} rows, ${values.length} transactions, total cost found to be $${totalCost} USD`);
       });
 
     } catch (e) {
@@ -176,6 +186,22 @@ parties.forEach((party, i) => {
    logger.debug(`email pretend-sent to ${parties.map((party, i) => party.email+(i === parties.length ? ', ' : '') )}`);
 });
 
+router.post('/test', async(req, res, next) => {
+  // const etherPrice = await provider.getEtherPrice();
+//https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey=YourApiKeyToken
+  const etherPrice = (await axios({
+    method: 'get',
+    url: `https://api.etherscan.io/api?module=stats&action=ethprice&apikey=${process.env.ETHERSCAN_API_KEY}`,
+  })).data.result.ethusd;
+  logger.info(`ether price: (${etherPrice})`);
+  const receipt = await etherScanProvider.getTransactionReceipt('0x06b8a3877d8cee66138ca968f085982ade05121a918a97dd1e93ad65056f49d2');
+  // logger.info(`transaction ${receipt.status ? 'succeeded' : 'failed'} $${receipt.effectiveGasPrice.mul(receipt.gasUsed)}`);
+  logger.info(`transaction ${receipt.status ? 'succeeded' : 'failed'} $${((ethers.utils.formatEther(receipt.effectiveGasPrice.mul(receipt.gasUsed))) / etherPrice).toFixed(2)}`);
+
+  return res.status(200).send('');
+});
+
+
 router.post('/create', async (req, res, next) => {
   const uploadedDocuments = req.files;
   const parties = JSON.parse(req.body.parties);
@@ -192,7 +218,7 @@ router.post('/create', async (req, res, next) => {
     const userProfileResponse = await getUser(token);
     const { email } = userProfileResponse.data;
 
-    createDocument(uploadedDocuments, parties, email)
+    await createDocument(uploadedDocuments, parties, description, email);
     return res.status(200).send();
   } catch (e) {
     logger.error(e);
@@ -219,7 +245,7 @@ router.post('/verify', async (req, res, next) => {
     return res.status(403).send('you do not own that document');
   }
 
-  const hash = etherUtils.keccak256(documentData.buffer);
+  const hash = ethers.utils.keccak256(documentData.buffer);
   const documentOnRecord = (await getDocument(id));
   const match = hash == documentOnRecord.hash;
   logger.debug(`hashes ${match ? '' : 'do not ' }match\n\tsubmitted document: ${hash}\n\tdocument on record: ${documentOnRecord.hash}`);
