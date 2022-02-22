@@ -6,10 +6,9 @@
     "start": "title BlockSign API Server && nodemon apiServer.js"
   },
   "dependencies": {
-    "auth0": "^2.37.0",
+    "axios": "^0.26.0",
     "cookie-parser": "~1.4.4",
     "cron-parser": "^4.2.1",
-    "debug": "~2.6.9",
     "ethers": "^5.5.4",
     "express": "~4.16.1",
     "express-form-data": "^2.0.17",

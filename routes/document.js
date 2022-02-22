@@ -19,10 +19,7 @@ const createDocument = async (documents, parties, description, email) => {
       const userID = userData.rows[0].id;
       // logger.debug(`user email: ${email}, id: ${userID}`);
 
-      const insertQuery = format(
-        'INSERT INTO documents (hash, original_file_name, original_file_size, description, ingestion_date, approval_date, owner_id, signatures_needed, signatures_obtained) VALUES %L',
-        documents.map((doc) => [ethers.utils.keccak256(doc.buffer), doc.originalname, doc.size, description || '', new Date(), new Date(), userID, parties.length, 0]));
-      const insertResponse = db.query(insertQuery);
+
       logger.debug(`successfully stored ${documents.length} files for user ${userID} (${email})`);
     } catch (e) {
         logger.error(`database error: ${e}`);
@@ -201,12 +198,23 @@ router.post('/test', async(req, res, next) => {
   return res.status(200).send('');
 });
 
+router.get('/', async (req, res) => {
+  try{
+    return res.status(200).send((await db.query('SELECT * from documents WHERE documents.owner_id=$1 ORDER BY ingestion_date',
+    [(await getUser(req.headers.authorization.split(' ')[1])).data.sub])).rows);
 
-router.post('/create', async (req, res, next) => {
+  } catch (e) {
+      logger.error(e);
+      return res.status(500).send('Error finding documents');
+    }
+  });
+
+
+
+router.post('/', async (req, res, next) => {
   const uploadedDocuments = req.files;
   const parties = JSON.parse(req.body.parties);
   const description = JSON.parse(req.body.description);
-  const token = req.headers.authorization.split(' ')[1];
 
   if (!uploadedDocuments) {
     logger.warn('document/create request received without document data');
@@ -215,10 +223,11 @@ router.post('/create', async (req, res, next) => {
   logger.debug(`document/create request received for${uploadedDocuments.map((doc) => `\n\t${doc.originalname} (${Math.trunc(doc.size/1024,2)}KB})`)}`);
 
   try{
-    const userProfileResponse = await getUser(token);
-    const { email } = userProfileResponse.data;
+    const userID = (await getUser(req.headers.authorization.split(' ')[1])).data.sub;
+    db.query(format(
+      'INSERT INTO documents (hash, original_file_name, original_file_size, description, ingestion_date, approval_date, owner_id, signatures_needed, signatures_obtained) VALUES %L',
+      uploadedDocuments.map((doc) => [ethers.utils.keccak256(doc.buffer), doc.originalname, doc.size, description || '', new Date(), new Date(), userID, parties.length, 0])));
 
-    await createDocument(uploadedDocuments, parties, description, email);
     return res.status(200).send();
   } catch (e) {
     logger.error(e);

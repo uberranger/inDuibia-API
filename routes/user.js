@@ -27,7 +27,7 @@ const ownsThisDoc = async (token, id) => {
   }
 }
 
-router.post('/profile', async (req, res) => {
+router.get('/profile', async (req, res) => {
 
   logger.debug(`retrieving user information for , ${req.user.sub} from ${req.user.aud}`);
   const userInfoResponse = await getUser(req.headers.authorization.split(' ')[1]);
